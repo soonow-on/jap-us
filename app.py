@@ -5,43 +5,33 @@ import yfinance as yf
 from sklearn.covariance import LedoitWolf
 from sklearn.decomposition import PCA
 import datetime
+import urllib.parse
 
-# ==========================================
-# 1. ログイン認証（パスワード保護）
-# ==========================================
+# --- 1. ログイン認証 ---
 def check_password():
-    """簡単なパスワード認証を行います"""
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
-
     def password_entered():
-        # ★ここで好きなパスワードを設定してください
-        if st.session_state["password_input"] == "sscoolj":
+        if st.session_state["password_input"] == "test2026":
             st.session_state["password_correct"] = True
-        else:
-            st.session_state["password_correct"] = False
-
     if not st.session_state["password_correct"]:
         st.title("🔒 ログイン")
-        st.text_input("パスワードを入力してください", type="password", key="password_input", on_change=password_entered)
-        if st.session_state.get("password_input") and not st.session_state["password_correct"]:
-            st.error("パスワードが間違っています。")
+        st.text_input("パスワード", type="password", key="password_input", on_change=password_entered)
         return False
     return True
 
-# パスワード認証
 if not check_password():
     st.stop()
 
-# ==========================================
-# 2. データ取得と予測モデル（裏側の計算）
-# ==========================================
-@st.cache_data(ttl=3600) 
-def run_prediction_model():
-    # 米国セクターETF（予測のヒントにする銘柄）
-    us_tickers = ['XLK', 'XLF', 'XLV', 'XLE', 'XLY', 'XLI', 'XLB']
-    
-    # 日本の業種別ETF（TOPIX-17シリーズ）全17銘柄
+# --- 2. 計算ロジック ---
+@st.cache_data(ttl=3600)
+def run_full_analysis():
+    # 米国セクター（表示名付き）
+    us_sectors = {
+        'XLK': '情報技術', 'XLF': '金融', 'XLV': 'ヘルスケア', 
+        'XLE': 'エネルギー', 'XLY': '一般消費財', 'XLI': '資本財', 'XLB': '素材'
+    }
+    # 日本業種
     jp_tickers = {
         '1617.T': '食品', '1618.T': 'エネルギー・資源', '1619.T': '建設・資材',
         '1620.T': '素材・化学', '1621.T': '医薬品', '1622.T': '自動車・輸送機',
@@ -51,98 +41,90 @@ def run_prediction_model():
         '1632.T': '金融（除く銀行）', '1633.T': '不動産'
     }
     
-    # 直近のデータを取得（過去90日分）
     end_date = datetime.date.today()
     start_date = end_date - datetime.timedelta(days=90)
     
     try:
-        # データのダウンロード
-        us_raw = yf.download(us_tickers, start=start_date, end=end_date)['Close']
-        jp_raw = yf.download(list(jp_tickers.keys()), start=start_date, end=end_date)['Close']
+        # データ取得
+        us_data = yf.download(list(us_sectors.keys()), start=start_date, end=end_date)['Close']
+        jp_data = yf.download(list(jp_tickers.keys()), start=start_date, end=end_date)['Close']
         
-        # リターン（変化率）に変換
-        us_returns = us_raw.pct_change().dropna()
-        jp_returns = jp_raw.pct_change().dropna()
+        # 前日比計算
+        us_ret = us_data.pct_change().dropna()
+        jp_ret = jp_data.pct_change().dropna()
         
-        # 行を合わせる（前日の米国で今日の日本を予測するため、データを1日ずらす）
-        common_index = us_returns.index.intersection(jp_returns.index)
-        us_final = us_returns.loc[common_index].iloc[:-1] # 最新日の1日前まで
-        jp_final = jp_returns.loc[common_index].iloc[1:]  # 翌日のデータ
-        
-        # 最小行数でカット
-        min_len = min(len(us_final), len(jp_final))
-        us_train = us_final.iloc[-min_len:]
-        jp_train = jp_final.iloc[-min_len:]
-        
-        # 【部分空間正則化PCAの近似】
-        # 1. Ledoit-Wolf法で共分散行列を安定化
-        lw = LedoitWolf().fit(us_train)
-        # 2. PCAで主成分（市場ファクター）を抽出
-        pca = PCA(n_components=3)
-        pca.fit(us_train)
-        
-        # 回帰分析（米国ファクターが日本業種に与える影響度を計算）
-        us_factors = pca.transform(us_train)
-        beta = np.linalg.pinv(us_factors.T @ us_factors) @ us_factors.T @ jp_train.values
-        
-        # 【予測実行】
-        # 最新の（昨晩の）米国市場リターンを使って、今日の日本を予測
-        latest_us_return = us_returns.iloc[-1].values.reshape(1, -1)
-        latest_factors = pca.transform(latest_us_return)
-        pred_returns = latest_factors @ beta
-        
-        # 結果の整理
-        pred_scores = pred_returns.flatten()
-        results = []
-        for i, (ticker, name) in enumerate(jp_tickers.items()):
-            results.append({
-                "銘柄コード": ticker.replace('.T', ''),
-                "業種名": name,
-                "予測スコア": round(pred_scores[i] * 100, 4)
-            })
-            
-        df_results = pd.DataFrame(results).sort_values(by="予測スコア", ascending=False).reset_index(drop=True)
-        return df_results, True
-        
-    except Exception as e:
-        st.error(f"エラーが発生しました: {e}")
-        return pd.DataFrame(), False
+        # 直近の米国騰落（理由として表示するため）
+        latest_us_perf = us_ret.iloc[-1] * 100
+        us_perf_df = pd.DataFrame({
+            'セクター': [us_sectors[t] for t in latest_us_perf.index],
+            '騰落率(%)': latest_us_perf.values.round(2)
+        }).sort_values('騰落率(%)', ascending=False)
 
-# ==========================================
-# 3. Web画面の表示
-# ==========================================
-st.set_page_config(page_title="日米業種リードラグ予測", layout="wide")
+        # モデル計算（PCA）
+        common = us_ret.index.intersection(jp_ret.index)
+        us_f = us_ret.loc[common].iloc[:-1]
+        jp_f = jp_ret.loc[common].iloc[1:]
+        min_l = min(len(us_f), len(jp_f))
+        
+        pca = PCA(n_components=3).fit(us_f.iloc[-min_l:])
+        us_factors = pca.transform(us_f.iloc[-min_l:])
+        beta = np.linalg.pinv(us_factors.T @ us_factors) @ us_factors.T @ jp_f.iloc[-min_l:].values
+        
+        # 予測
+        pred = pca.transform(us_ret.iloc[-1:].values) @ beta
+        
+        res = []
+        for i, (t, name) in enumerate(jp_tickers.items()):
+            res.append({"銘柄コード": t.replace('.T',''), "業種名": name, "予測スコア": round(pred[0][i]*100, 4)})
+        
+        return pd.DataFrame(res).sort_values("予測スコア", ascending=False), us_perf_df, True
+    except:
+        return pd.DataFrame(), pd.DataFrame(), False
 
-st.title("📊 日米業種リードラグ 予測ダッシュボード")
-st.write(f"**取得日時:** {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-st.info("米国セクターの動きから、本日の日本市場（日中）の強弱を予測します。")
+# --- 3. 画面表示 ---
+st.set_page_config(page_title="日米リードラグ分析", layout="wide")
+st.title("📊 日米業種リードラグ予測 & 理由分析")
 
-with st.spinner("計算中..."):
-    df_ranking, success = run_prediction_model()
+df, us_df, success = run_full_analysis()
 
 if success:
-    # トレンドアイコンの設定
-    def get_icon(score):
-        if score > 0.3: return "☀️ (強気)"
-        elif score > 0: return "🌤️ (やや強気)"
-        elif score > -0.3: return "☁️ (やや弱気)"
-        else: return "☔️ (弱気)"
-
-    df_ranking.insert(0, "トレンド", df_ranking["予測スコア"].apply(get_icon))
-
-    # ハイライト表示
+    # --- サマリーエリア ---
     col1, col2 = st.columns(2)
     with col1:
-        st.success(f"### ☀️ 本日の買い推奨\n**{df_ranking.iloc[0]['銘柄コード']} ({df_ranking.iloc[0]['業種名']})**")
+        top = df.iloc[0]
+        st.success(f"### ☀️ 今日の買い：{top['業種名']} ({top['銘柄コード']})")
+        q_long = urllib.parse.quote(f"日本株 {top['業種名']} ニュース")
+        st.markdown(f"[🔗 この業種のニュースをチェック](https://www.google.com/search?q={q_long}&tbm=nws)")
+        
     with col2:
-        st.error(f"### ☔️ 本日の売り推奨\n**{df_ranking.iloc[-1]['銘柄コード']} ({df_ranking.iloc[-1]['業種名']})**")
+        bottom = df.iloc[-1]
+        st.error(f"### ☔️ 今日の売り：{bottom['業種名']} ({bottom['銘柄コード']})")
+        q_short = urllib.parse.quote(f"日本株 {bottom['業種名']} ニュース")
+        st.markdown(f"[🔗 この業種のニュースをチェック](https://www.google.com/search?q={q_short}&tbm=nws)")
 
     st.divider()
 
-    # 全ランキング表示
-    st.subheader("🏆 全17業種 予測ランキング")
-    st.dataframe(df_ranking, use_container_width=True, height=650)
+    # --- 理由の分析エリア ---
+    st.subheader("🧐 なぜこの予測になったのか？（米国市場の振り返り）")
+    st.write("昨晩の米国市場のセクター別騰落状況です。この動きが「理由」となって日本の予測スコアが計算されています。")
     
-    st.caption("※本ツールは特定の銘柄の売買を推奨するものではありません。投資は自己責任でお願いします。")
+    # 米国騰落を横並びで表示
+    us_cols = st.columns(len(us_df))
+    for i, row in enumerate(us_df.itertuples()):
+        color = "red" if row._2 < 0 else "green"
+        us_cols[i].metric(row.セクター, f"{row._2}%")
+
+    st.divider()
+
+    # --- 全ランキング ---
+    st.subheader("🏆 全17業種 予測ランキング")
+    def get_icon(s):
+        if s > 0.3: return "☀️"
+        elif s > 0: return "🌤️"
+        elif s > -0.3: return "☁️"
+        else: return "☔️"
+    df.insert(0, "トレンド", df["予測スコア"].apply(get_icon))
+    st.dataframe(df, use_container_width=True, height=600)
+
 else:
-    st.warning("データの取得に失敗しました。市場が休場、または通信エラーの可能性があります。")
+    st.error("データ取得エラー。時間をおいて試してください。")
