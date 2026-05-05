@@ -16,7 +16,7 @@ def check_password():
 
     def password_entered():
         # ★ここで好きなパスワードを設定してください（現在は「test2026」）
-        if st.session_state["password_input"] == "test2026":
+        if st.session_state["password_input"] == "sscoolj":
             st.session_state["password_correct"] = True
         else:
             st.session_state["password_correct"] = False
