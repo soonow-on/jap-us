@@ -12,7 +12,7 @@ def check_password():
     if "password_correct" not in st.session_state:
         st.session_state["password_correct"] = False
     def password_entered():
-        if st.session_state["password_input"] == "test2026":
+        if st.session_state["password_input"] == "sscoolj":
             st.session_state["password_correct"] = True
     if not st.session_state["password_correct"]:
         st.title("🔒 ログイン")
