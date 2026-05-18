@@ -2,7 +2,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import yfinance as yf
-from sklearn.covariance import LedoitWolf
 from sklearn.decomposition import PCA
 import datetime
 import urllib.parse
@@ -26,12 +25,10 @@ if not check_password():
 # --- 2. 計算ロジック ---
 @st.cache_data(ttl=3600)
 def run_full_analysis():
-    # 米国セクター（表示名付き）
     us_sectors = {
         'XLK': '情報技術', 'XLF': '金融', 'XLV': 'ヘルスケア', 
         'XLE': 'エネルギー', 'XLY': '一般消費財', 'XLI': '資本財', 'XLB': '素材'
     }
-    # 日本業種
     jp_tickers = {
         '1617.T': '食品', '1618.T': 'エネルギー・資源', '1619.T': '建設・資材',
         '1620.T': '素材・化学', '1621.T': '医薬品', '1622.T': '自動車・輸送機',
@@ -45,28 +42,46 @@ def run_full_analysis():
     start_date = end_date - datetime.timedelta(days=90)
     
     try:
-        # データ取得
-        us_data = yf.download(list(us_sectors.keys()), start=start_date, end=end_date)['Close']
-        jp_data = yf.download(list(jp_tickers.keys()), start=start_date, end=end_date)['Close']
+        # yfinanceの仕様変更に耐える安全なデータ取得
+        us_raw = yf.download(list(us_sectors.keys()), start=start_date, end=end_date, progress=False)
+        jp_raw = yf.download(list(jp_tickers.keys()), start=start_date, end=end_date, progress=False)
+        sp500_raw = yf.download("^GSPC", start=start_date, end=end_date, progress=False) # トレンド判定用
+
+        # MultiIndexのハンドリングと終値の取得
+        us_data = us_raw['Close'] if 'Close' in us_raw.columns else us_raw
+        jp_data = jp_raw['Close'] if 'Close' in jp_raw.columns else jp_raw
+        sp500_close = sp500_raw['Close'] if 'Close' in sp500_raw.columns else sp500_raw
         
-        # 前日比計算
-        us_ret = us_data.pct_change().dropna()
-        jp_ret = jp_data.pct_change().dropna()
+        # 欠損値を0で埋める（dropnaによるデータ全消去を防ぐ）
+        us_ret = us_data.pct_change().fillna(0)
+        jp_ret = jp_data.pct_change().fillna(0)
         
-        # 直近の米国騰落（理由として表示するため）
+        # 直近の米国騰落
         latest_us_perf = us_ret.iloc[-1] * 100
         us_perf_df = pd.DataFrame({
-            'セクター': [us_sectors[t] for t in latest_us_perf.index],
+            'セクター': [us_sectors.get(t, t) for t in latest_us_perf.index],
             '騰落率(%)': latest_us_perf.values.round(2)
         }).sort_values('騰落率(%)', ascending=False)
 
+        # 全体のトレンド判定 (S&P500の25日移動平均)
+        if isinstance(sp500_close, pd.DataFrame):
+            sp500_close = sp500_close.squeeze()
+        ma25 = sp500_close.rolling(window=25).mean().iloc[-1]
+        current_sp = sp500_close.iloc[-1]
+        market_trend = "上昇トレンド📈 (強気)" if current_sp > ma25 else "下落トレンド📉 (慎重)"
+
         # モデル計算（PCA）
         common = us_ret.index.intersection(jp_ret.index)
+        if len(common) < 5:
+            raise ValueError("共通する営業日のデータが少なすぎます")
+
         us_f = us_ret.loc[common].iloc[:-1]
         jp_f = jp_ret.loc[common].iloc[1:]
         min_l = min(len(us_f), len(jp_f))
         
-        pca = PCA(n_components=3).fit(us_f.iloc[-min_l:])
+        # PCAのコンポーネント数がサンプル数を超えないようにガード
+        n_comp = min(3, min_l)
+        pca = PCA(n_components=n_comp).fit(us_f.iloc[-min_l:])
         us_factors = pca.transform(us_f.iloc[-min_l:])
         beta = np.linalg.pinv(us_factors.T @ us_factors) @ us_factors.T @ jp_f.iloc[-min_l:].values
         
@@ -75,19 +90,24 @@ def run_full_analysis():
         
         res = []
         for i, (t, name) in enumerate(jp_tickers.items()):
-            res.append({"銘柄コード": t.replace('.T',''), "業種名": name, "予測スコア": round(pred[0][i]*100, 4)})
+            # tickerがアルファベット順に並び替えられている可能性があるため位置を特定
+            loc = list(jp_data.columns).index(t)
+            res.append({"銘柄コード": t.replace('.T',''), "業種名": name, "予測スコア": round(pred[0][loc]*100, 4)})
         
-        return pd.DataFrame(res).sort_values("予測スコア", ascending=False), us_perf_df, True
-    except:
-        return pd.DataFrame(), pd.DataFrame(), False
+        return pd.DataFrame(res).sort_values("予測スコア", ascending=False), us_perf_df, market_trend, True
+    except Exception as e:
+        print(f"Error: {e}")
+        return pd.DataFrame(), pd.DataFrame(), "", False
 
 # --- 3. 画面表示 ---
 st.set_page_config(page_title="日米リードラグ分析", layout="wide")
 st.title("📊 日米業種リードラグ予測 & 理由分析")
 
-df, us_df, success = run_full_analysis()
+df, us_df, market_trend, success = run_full_analysis()
 
 if success:
+    st.info(f"💡 **現在の米国市場環境 (S&P500 25日線判定):** {market_trend}\n\n※下落トレンド時は「買い」シグナルが出ても見送るなどの自己ルールが有効です。")
+    
     # --- サマリーエリア ---
     col1, col2 = st.columns(2)
     with col1:
@@ -108,10 +128,8 @@ if success:
     st.subheader("🧐 なぜこの予測になったのか？（米国市場の振り返り）")
     st.write("昨晩の米国市場のセクター別騰落状況です。この動きが「理由」となって日本の予測スコアが計算されています。")
     
-    # 米国騰落を横並びで表示
     us_cols = st.columns(len(us_df))
     for i, row in enumerate(us_df.itertuples()):
-        color = "red" if row._2 < 0 else "green"
         us_cols[i].metric(row.セクター, f"{row._2}%")
 
     st.divider()
@@ -123,8 +141,9 @@ if success:
         elif s > 0: return "🌤️"
         elif s > -0.3: return "☁️"
         else: return "☔️"
+    
     df.insert(0, "トレンド", df["予測スコア"].apply(get_icon))
     st.dataframe(df, use_container_width=True, height=600)
 
 else:
-    st.error("データ取得エラー。時間をおいて試してください。")
+    st.error("データ取得エラー。時間をおいて試すか、コードの修正を確認してください。")
